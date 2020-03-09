@@ -40,6 +40,7 @@ type Broker struct {
 	outgoingByteRate       metrics.Meter
 	responseRate           metrics.Meter
 	responseSize           metrics.Histogram
+	requestsInFlight       metrics.Counter
 	brokerIncomingByteRate metrics.Meter
 	brokerRequestRate      metrics.Meter
 	brokerRequestSize      metrics.Histogram
@@ -47,6 +48,7 @@ type Broker struct {
 	brokerOutgoingByteRate metrics.Meter
 	brokerResponseRate     metrics.Meter
 	brokerResponseSize     metrics.Histogram
+	brokerRequestsInFlight metrics.Counter
 
 	kerberosAuthenticator GSSAPIKerberosAuth
 }
@@ -117,6 +119,7 @@ type SCRAMClient interface {
 type responsePromise struct {
 	requestTime   time.Time
 	correlationID int32
+	headerVersion int16
 	packets       chan []byte
 	errors        chan error
 }
@@ -182,6 +185,7 @@ func (b *Broker) Open(conf *Config) error {
 		b.outgoingByteRate = metrics.GetOrRegisterMeter("outgoing-byte-rate", conf.MetricRegistry)
 		b.responseRate = metrics.GetOrRegisterMeter("response-rate", conf.MetricRegistry)
 		b.responseSize = getOrRegisterHistogram("response-size", conf.MetricRegistry)
+		b.requestsInFlight = metrics.GetOrRegisterCounter("requests-in-flight", conf.MetricRegistry)
 		// Do not gather metrics for seeded broker (only used during bootstrap) because they share
 		// the same id (-1) and are already exposed through the global metrics above
 		if b.id >= 0 {
@@ -189,7 +193,6 @@ func (b *Broker) Open(conf *Config) error {
 		}
 
 		if conf.Net.SASL.Enable {
-
 			b.connErr = b.authenticateViaSASL()
 
 			if b.connErr != nil {
@@ -511,6 +514,32 @@ func (b *Broker) CreatePartitions(request *CreatePartitionsRequest) (*CreatePart
 	return response, nil
 }
 
+//AlterPartitionReassignments sends a alter partition reassignments request and
+//returns alter partition reassignments response
+func (b *Broker) AlterPartitionReassignments(request *AlterPartitionReassignmentsRequest) (*AlterPartitionReassignmentsResponse, error) {
+	response := new(AlterPartitionReassignmentsResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+//ListPartitionReassignments sends a list partition reassignments request and
+//returns list partition reassignments response
+func (b *Broker) ListPartitionReassignments(request *ListPartitionReassignmentsRequest) (*ListPartitionReassignmentsResponse, error) {
+	response := new(ListPartitionReassignmentsResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
 //DeleteRecords send a request to delete records and return delete record
 //response or error
 func (b *Broker) DeleteRecords(request *DeleteRecordsRequest) (*DeleteRecordsResponse, error) {
@@ -691,7 +720,7 @@ func (b *Broker) write(buf []byte) (n int, err error) {
 	return b.conn.Write(buf)
 }
 
-func (b *Broker) send(rb protocolBody, promiseResponse bool) (*responsePromise, error) {
+func (b *Broker) send(rb protocolBody, promiseResponse bool, responseHeaderVersion int16) (*responsePromise, error) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 
@@ -713,27 +742,35 @@ func (b *Broker) send(rb protocolBody, promiseResponse bool) (*responsePromise, 
 	}
 
 	requestTime := time.Now()
+	// Will be decremented in responseReceiver (except error or request with NoResponse)
+	b.addRequestInFlightMetrics(1)
 	bytes, err := b.write(buf)
 	b.updateOutgoingCommunicationMetrics(bytes)
 	if err != nil {
+		b.addRequestInFlightMetrics(-1)
 		return nil, err
 	}
 	b.correlationID++
 
 	if !promiseResponse {
 		// Record request latency without the response
-		b.updateRequestLatencyMetrics(time.Since(requestTime))
+		b.updateRequestLatencyAndInFlightMetrics(time.Since(requestTime))
 		return nil, nil
 	}
 
-	promise := responsePromise{requestTime, req.correlationID, make(chan []byte), make(chan error)}
+	promise := responsePromise{requestTime, req.correlationID, responseHeaderVersion, make(chan []byte), make(chan error)}
 	b.responses <- promise
 
 	return &promise, nil
 }
 
-func (b *Broker) sendAndReceive(req protocolBody, res versionedDecoder) error {
-	promise, err := b.send(req, res != nil)
+func (b *Broker) sendAndReceive(req protocolBody, res protocolBody) error {
+	responseHeaderVersion := int16(-1)
+	if res != nil {
+		responseHeaderVersion = res.headerVersion()
+	}
+
+	promise, err := b.send(req, res != nil, responseHeaderVersion)
 	if err != nil {
 		return err
 	}
@@ -813,13 +850,18 @@ func (b *Broker) encode(pe packetEncoder, version int16) (err error) {
 
 func (b *Broker) responseReceiver() {
 	var dead error
-	header := make([]byte, 8)
 
 	for response := range b.responses {
 		if dead != nil {
+			// This was previously incremented in send() and
+			// we are not calling updateIncomingCommunicationMetrics()
+			b.addRequestInFlightMetrics(-1)
 			response.errors <- dead
 			continue
 		}
+
+		var headerLength = getHeaderLength(response.headerVersion)
+		header := make([]byte, headerLength)
 
 		bytesReadHeader, err := b.readFull(header)
 		requestLatency := time.Since(response.requestTime)
@@ -831,7 +873,7 @@ func (b *Broker) responseReceiver() {
 		}
 
 		decodedHeader := responseHeader{}
-		err = decode(header, &decodedHeader)
+		err = versionedDecode(header, &decodedHeader, response.headerVersion)
 		if err != nil {
 			b.updateIncomingCommunicationMetrics(bytesReadHeader, requestLatency)
 			dead = err
@@ -847,7 +889,7 @@ func (b *Broker) responseReceiver() {
 			continue
 		}
 
-		buf := make([]byte, decodedHeader.length-4)
+		buf := make([]byte, decodedHeader.length-int32(headerLength)+4)
 		bytesReadBody, err := b.readFull(buf)
 		b.updateIncomingCommunicationMetrics(bytesReadHeader+bytesReadBody, requestLatency)
 		if err != nil {
@@ -859,6 +901,15 @@ func (b *Broker) responseReceiver() {
 		response.packets <- buf
 	}
 	close(b.done)
+}
+
+func getHeaderLength(headerVersion int16) int8 {
+	if headerVersion < 1 {
+		return 8
+	} else {
+		// header contains additional tagged field length (0), we don't support actual tags yet.
+		return 9
+	}
 }
 
 func (b *Broker) authenticateViaSASL() error {
@@ -892,9 +943,12 @@ func (b *Broker) sendAndReceiveSASLHandshake(saslType SASLMechanism, version int
 	}
 
 	requestTime := time.Now()
+	// Will be decremented in updateIncomingCommunicationMetrics (except error)
+	b.addRequestInFlightMetrics(1)
 	bytes, err := b.write(buf)
 	b.updateOutgoingCommunicationMetrics(bytes)
 	if err != nil {
+		b.addRequestInFlightMetrics(-1)
 		Logger.Printf("Failed to send SASL handshake %s: %s\n", b.addr, err.Error())
 		return err
 	}
@@ -903,6 +957,7 @@ func (b *Broker) sendAndReceiveSASLHandshake(saslType SASLMechanism, version int
 	header := make([]byte, 8) // response header
 	_, err = b.readFull(header)
 	if err != nil {
+		b.addRequestInFlightMetrics(-1)
 		Logger.Printf("Failed to read SASL handshake header : %s\n", err.Error())
 		return err
 	}
@@ -911,6 +966,7 @@ func (b *Broker) sendAndReceiveSASLHandshake(saslType SASLMechanism, version int
 	payload := make([]byte, length-4)
 	n, err := b.readFull(payload)
 	if err != nil {
+		b.addRequestInFlightMetrics(-1)
 		Logger.Printf("Failed to read SASL handshake payload : %s\n", err.Error())
 		return err
 	}
@@ -961,7 +1017,6 @@ func (b *Broker) sendAndReceiveSASLPlainAuth() error {
 	// default to V0 to allow for backward compatability when SASL is enabled
 	// but not the handshake
 	if b.conf.Net.SASL.Handshake {
-
 		handshakeErr := b.sendAndReceiveSASLHandshake(SASLTypePlaintext, b.conf.Net.SASL.Version)
 		if handshakeErr != nil {
 			Logger.Printf("Error while performing SASL handshake %s\n", b.addr)
@@ -977,16 +1032,18 @@ func (b *Broker) sendAndReceiveSASLPlainAuth() error {
 
 // sendAndReceiveV0SASLPlainAuth flows the v0 sasl auth NOT wrapped in the kafka protocol
 func (b *Broker) sendAndReceiveV0SASLPlainAuth() error {
-
 	length := len(b.conf.Net.SASL.AuthIdentity) + 1 + len(b.conf.Net.SASL.User) + 1 + len(b.conf.Net.SASL.Password)
 	authBytes := make([]byte, length+4) //4 byte length header + auth data
 	binary.BigEndian.PutUint32(authBytes, uint32(length))
 	copy(authBytes[4:], []byte(b.conf.Net.SASL.AuthIdentity+"\x00"+b.conf.Net.SASL.User+"\x00"+b.conf.Net.SASL.Password))
 
 	requestTime := time.Now()
+	// Will be decremented in updateIncomingCommunicationMetrics (except error)
+	b.addRequestInFlightMetrics(1)
 	bytesWritten, err := b.write(authBytes)
 	b.updateOutgoingCommunicationMetrics(bytesWritten)
 	if err != nil {
+		b.addRequestInFlightMetrics(-1)
 		Logger.Printf("Failed to write SASL auth header to broker %s: %s\n", b.addr, err.Error())
 		return err
 	}
@@ -1011,11 +1068,13 @@ func (b *Broker) sendAndReceiveV1SASLPlainAuth() error {
 
 	requestTime := time.Now()
 
+	// Will be decremented in updateIncomingCommunicationMetrics (except error)
+	b.addRequestInFlightMetrics(1)
 	bytesWritten, err := b.sendSASLPlainAuthClientResponse(correlationID)
-
 	b.updateOutgoingCommunicationMetrics(bytesWritten)
 
 	if err != nil {
+		b.addRequestInFlightMetrics(-1)
 		Logger.Printf("Failed to write SASL auth header to broker %s: %s\n", b.addr, err.Error())
 		return err
 	}
@@ -1068,16 +1127,18 @@ func (b *Broker) sendAndReceiveSASLOAuth(provider AccessTokenProvider) error {
 // if the broker responds with a challenge, in which case the token is
 // rejected.
 func (b *Broker) sendClientMessage(message []byte) (bool, error) {
-
 	requestTime := time.Now()
+	// Will be decremented in updateIncomingCommunicationMetrics (except error)
+	b.addRequestInFlightMetrics(1)
 	correlationID := b.correlationID
 
 	bytesWritten, err := b.sendSASLOAuthBearerClientMessage(message, correlationID)
+	b.updateOutgoingCommunicationMetrics(bytesWritten)
 	if err != nil {
+		b.addRequestInFlightMetrics(-1)
 		return false, err
 	}
 
-	b.updateOutgoingCommunicationMetrics(bytesWritten)
 	b.correlationID++
 
 	res := &SaslAuthenticateResponse{}
@@ -1108,22 +1169,25 @@ func (b *Broker) sendAndReceiveSASLSCRAMv1() error {
 	msg, err := scramClient.Step("")
 	if err != nil {
 		return fmt.Errorf("failed to advance the SCRAM exchange: %s", err.Error())
-
 	}
 
 	for !scramClient.Done() {
 		requestTime := time.Now()
+		// Will be decremented in updateIncomingCommunicationMetrics (except error)
+		b.addRequestInFlightMetrics(1)
 		correlationID := b.correlationID
 		bytesWritten, err := b.sendSaslAuthenticateRequest(correlationID, []byte(msg))
+		b.updateOutgoingCommunicationMetrics(bytesWritten)
 		if err != nil {
+			b.addRequestInFlightMetrics(-1)
 			Logger.Printf("Failed to write SASL auth header to broker %s: %s\n", b.addr, err.Error())
 			return err
 		}
 
-		b.updateOutgoingCommunicationMetrics(bytesWritten)
 		b.correlationID++
 		challenge, err := b.receiveSaslAuthenticateResponse(correlationID)
 		if err != nil {
+			b.addRequestInFlightMetrics(-1)
 			Logger.Printf("Failed to read response while authenticating with SASL to broker %s: %s\n", b.addr, err.Error())
 			return err
 		}
@@ -1159,7 +1223,7 @@ func (b *Broker) receiveSaslAuthenticateResponse(correlationID int32) ([]byte, e
 	}
 
 	header := responseHeader{}
-	err = decode(buf, &header)
+	err = versionedDecode(buf, &header, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1228,7 +1292,6 @@ func (b *Broker) sendSASLPlainAuthClientResponse(correlationID int32) (int, erro
 }
 
 func (b *Broker) sendSASLOAuthBearerClientMessage(initialResp []byte, correlationID int32) (int, error) {
-
 	rb := &SaslAuthenticateRequest{initialResp}
 
 	req := &request{correlationID: correlationID, clientID: b.conf.ClientID, body: rb}
@@ -1249,7 +1312,7 @@ func (b *Broker) receiveSASLServerResponse(res *SaslAuthenticateResponse, correl
 	}
 
 	header := responseHeader{}
-	err = decode(buf, &header)
+	err = versionedDecode(buf, &header, 0)
 	if err != nil {
 		return bytesRead, err
 	}
@@ -1277,7 +1340,7 @@ func (b *Broker) receiveSASLServerResponse(res *SaslAuthenticateResponse, correl
 }
 
 func (b *Broker) updateIncomingCommunicationMetrics(bytes int, requestLatency time.Duration) {
-	b.updateRequestLatencyMetrics(requestLatency)
+	b.updateRequestLatencyAndInFlightMetrics(requestLatency)
 	b.responseRate.Mark(1)
 
 	if b.brokerResponseRate != nil {
@@ -1296,7 +1359,7 @@ func (b *Broker) updateIncomingCommunicationMetrics(bytes int, requestLatency ti
 	}
 }
 
-func (b *Broker) updateRequestLatencyMetrics(requestLatency time.Duration) {
+func (b *Broker) updateRequestLatencyAndInFlightMetrics(requestLatency time.Duration) {
 	requestLatencyInMs := int64(requestLatency / time.Millisecond)
 	b.requestLatency.Update(requestLatencyInMs)
 
@@ -1304,6 +1367,14 @@ func (b *Broker) updateRequestLatencyMetrics(requestLatency time.Duration) {
 		b.brokerRequestLatency.Update(requestLatencyInMs)
 	}
 
+	b.addRequestInFlightMetrics(-1)
+}
+
+func (b *Broker) addRequestInFlightMetrics(i int64) {
+	b.requestsInFlight.Inc(i)
+	if b.brokerRequestsInFlight != nil {
+		b.brokerRequestsInFlight.Inc(i)
+	}
 }
 
 func (b *Broker) updateOutgoingCommunicationMetrics(bytes int) {
@@ -1322,7 +1393,6 @@ func (b *Broker) updateOutgoingCommunicationMetrics(bytes int) {
 	if b.brokerRequestSize != nil {
 		b.brokerRequestSize.Update(requestSize)
 	}
-
 }
 
 func (b *Broker) registerMetrics() {
@@ -1333,12 +1403,14 @@ func (b *Broker) registerMetrics() {
 	b.brokerOutgoingByteRate = b.registerMeter("outgoing-byte-rate")
 	b.brokerResponseRate = b.registerMeter("response-rate")
 	b.brokerResponseSize = b.registerHistogram("response-size")
+	b.brokerRequestsInFlight = b.registerCounter("requests-in-flight")
 }
 
 func (b *Broker) unregisterMetrics() {
 	for _, name := range b.registeredMetrics {
 		b.conf.MetricRegistry.Unregister(name)
 	}
+	b.registeredMetrics = nil
 }
 
 func (b *Broker) registerMeter(name string) metrics.Meter {
@@ -1351,4 +1423,10 @@ func (b *Broker) registerHistogram(name string) metrics.Histogram {
 	nameForBroker := getMetricNameForBroker(name, b)
 	b.registeredMetrics = append(b.registeredMetrics, nameForBroker)
 	return getOrRegisterHistogram(nameForBroker, b.conf.MetricRegistry)
+}
+
+func (b *Broker) registerCounter(name string) metrics.Counter {
+	nameForBroker := getMetricNameForBroker(name, b)
+	b.registeredMetrics = append(b.registeredMetrics, nameForBroker)
+	return metrics.GetOrRegisterCounter(nameForBroker, b.conf.MetricRegistry)
 }

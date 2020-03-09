@@ -42,6 +42,10 @@ func (m mockEncoder) encode(pe packetEncoder) error {
 	return pe.putRawBytes(m.bytes)
 }
 
+func (m mockEncoder) headerVersion() int16 {
+	return 0
+}
+
 type brokerMetrics struct {
 	bytesRead    int
 	bytesWritten int
@@ -109,7 +113,6 @@ func TestSimpleBrokerCommunication(t *testing.T) {
 			t.Error(err)
 		}
 	}
-
 }
 
 var ErrTokenFailure = errors.New("Failure generating token")
@@ -131,7 +134,6 @@ func newTokenProvider(token *AccessToken, err error) *TokenProvider {
 }
 
 func TestSASLOAuthBearer(t *testing.T) {
-
 	testTable := []struct {
 		name                      string
 		authidentity              string
@@ -202,7 +204,6 @@ func TestSASLOAuthBearer(t *testing.T) {
 	}
 
 	for i, test := range testTable {
-
 		// mockBroker mocks underlying network logic and broker responses
 		mockBroker := NewMockBroker(t, 0)
 
@@ -220,6 +221,7 @@ func TestSASLOAuthBearer(t *testing.T) {
 		broker.responseSize = metrics.NilHistogram{}
 		broker.responseRate = metrics.NilMeter{}
 		broker.requestLatency = metrics.NilHistogram{}
+		broker.requestsInFlight = metrics.NilCounter{}
 
 		conf := NewConfig()
 		conf.Net.SASL.Mechanism = SASLTypeOAuth
@@ -246,10 +248,6 @@ func TestSASLOAuthBearer(t *testing.T) {
 		if test.expectedBrokerError != ErrNoError {
 			if test.expectedBrokerError != err {
 				t.Errorf("[%d]:[%s] Expected %s auth error, got %s\n", i, test.name, test.expectedBrokerError, err)
-			}
-		} else if test.expectedBrokerError != ErrNoError {
-			if test.expectedBrokerError != err {
-				t.Errorf("[%d]:[%s] Expected %s handshake error, got %s\n", i, test.name, test.expectedBrokerError, err)
 			}
 		} else if test.expectClientErr && err == nil {
 			t.Errorf("[%d]:[%s] Expected a client error and got none\n", i, test.name)
@@ -327,7 +325,6 @@ func TestSASLSCRAMSHAXXX(t *testing.T) {
 	}
 
 	for i, test := range testTable {
-
 		// mockBroker mocks underlying network logic and broker responses
 		mockBroker := NewMockBroker(t, 0)
 		broker := NewBroker(mockBroker.Addr())
@@ -339,6 +336,7 @@ func TestSASLSCRAMSHAXXX(t *testing.T) {
 		broker.responseSize = metrics.NilHistogram{}
 		broker.responseRate = metrics.NilMeter{}
 		broker.requestLatency = metrics.NilHistogram{}
+		broker.requestsInFlight = metrics.NilCounter{}
 
 		mockSASLAuthResponse := NewMockSaslAuthenticateResponse(t).SetAuthBytes([]byte(test.scramChallengeResp))
 		mockSASLHandshakeResponse := NewMockSaslHandshakeResponse(t).SetEnabledMechanisms([]string{SASLTypeSCRAMSHA256, SASLTypeSCRAMSHA512})
@@ -395,7 +393,6 @@ func TestSASLSCRAMSHAXXX(t *testing.T) {
 }
 
 func TestSASLPlainAuth(t *testing.T) {
-
 	testTable := []struct {
 		name             string
 		authidentity     string
@@ -427,7 +424,6 @@ func TestSASLPlainAuth(t *testing.T) {
 	}
 
 	for i, test := range testTable {
-
 		// mockBroker mocks underlying network logic and broker responses
 		mockBroker := NewMockBroker(t, 0)
 
@@ -459,6 +455,7 @@ func TestSASLPlainAuth(t *testing.T) {
 		broker.responseSize = metrics.NilHistogram{}
 		broker.responseRate = metrics.NilMeter{}
 		broker.requestLatency = metrics.NilHistogram{}
+		broker.requestsInFlight = metrics.NilCounter{}
 
 		conf := NewConfig()
 		conf.Net.SASL.Mechanism = SASLTypePlaintext
@@ -542,6 +539,7 @@ func TestSASLReadTimeout(t *testing.T) {
 		broker.responseSize = metrics.NilHistogram{}
 		broker.responseRate = metrics.NilMeter{}
 		broker.requestLatency = metrics.NilHistogram{}
+		broker.requestsInFlight = metrics.NilCounter{}
 	}
 
 	conf := NewConfig()
@@ -570,7 +568,6 @@ func TestSASLReadTimeout(t *testing.T) {
 }
 
 func TestGSSAPIKerberosAuth_Authorize(t *testing.T) {
-
 	testTable := []struct {
 		name               string
 		error              error
@@ -633,6 +630,7 @@ func TestGSSAPIKerberosAuth_Authorize(t *testing.T) {
 		broker.responseSize = metrics.NilHistogram{}
 		broker.responseRate = metrics.NilMeter{}
 		broker.requestLatency = metrics.NilHistogram{}
+		broker.requestsInFlight = metrics.NilCounter{}
 		conf := NewConfig()
 		conf.Net.SASL.Mechanism = SASLTypeGSSAPI
 		conf.Net.SASL.GSSAPI.ServiceName = "kafka"
@@ -686,11 +684,9 @@ func TestGSSAPIKerberosAuth_Authorize(t *testing.T) {
 
 		mockBroker.Close()
 	}
-
 }
 
 func TestBuildClientFirstMessage(t *testing.T) {
-
 	testTable := []struct {
 		name        string
 		token       *AccessToken
@@ -727,7 +723,6 @@ func TestBuildClientFirstMessage(t *testing.T) {
 	}
 
 	for i, test := range testTable {
-
 		actual, err := buildClientFirstMessage(test.token)
 
 		if !reflect.DeepEqual(test.expected, actual) {
@@ -999,6 +994,9 @@ func validateBrokerMetrics(t *testing.T, broker *Broker, mockBrokerMetrics broke
 	metricValidators.registerForAllBrokers(broker, countMeterValidator("request-rate", 1))
 	metricValidators.registerForAllBrokers(broker, countHistogramValidator("request-size", 1))
 	metricValidators.registerForAllBrokers(broker, minMaxHistogramValidator("request-size", mockBrokerBytesRead, mockBrokerBytesRead))
+
+	// Check that there is no more requests in flight
+	metricValidators.registerForAllBrokers(broker, counterValidator("requests-in-flight", 0))
 
 	// Run the validators
 	metricValidators.run(t, broker.conf.MetricRegistry)

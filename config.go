@@ -352,6 +352,11 @@ type Config struct {
 		// offsets. This currently requires the manual use of an OffsetManager
 		// but will eventually be automated.
 		Offsets struct {
+			// Deprecated: CommitInterval exists for historical compatibility
+			// and should not be used. Please use Consumer.Offsets.AutoCommit
+			CommitInterval time.Duration
+
+			// AutoCommit specifies configuration for commit messages automatically.
 			AutoCommit struct {
 				// Whether or not to auto-commit updated offsets back to the broker.
 				// (default enabled).
@@ -391,6 +396,10 @@ type Config struct {
 	// debugging, and auditing purposes. Defaults to "sarama", but you should
 	// probably set it to something specific to your application.
 	ClientID string
+	// A rack identifier for this client. This can be any string value which
+	// indicates where this client is physically located.
+	// It corresponds with the broker config 'broker.rack'
+	RackID string
 	// The number of events to buffer in internal and external channels. This
 	// permits the producer and consumer to continue processing some messages
 	// in the background while user code is working, greatly improving throughput.
@@ -679,13 +688,18 @@ func (c *Config) Validate() error {
 	case c.Consumer.Retry.Backoff < 0:
 		return ConfigurationError("Consumer.Retry.Backoff must be >= 0")
 	case c.Consumer.Offsets.AutoCommit.Interval <= 0:
-		return ConfigurationError("Consumer.Offsets.CommitInterval must be > 0")
+		return ConfigurationError("Consumer.Offsets.AutoCommit.Interval must be > 0")
 	case c.Consumer.Offsets.Initial != OffsetOldest && c.Consumer.Offsets.Initial != OffsetNewest:
 		return ConfigurationError("Consumer.Offsets.Initial must be OffsetOldest or OffsetNewest")
 	case c.Consumer.Offsets.Retry.Max < 0:
 		return ConfigurationError("Consumer.Offsets.Retry.Max must be >= 0")
 	case c.Consumer.IsolationLevel != ReadUncommitted && c.Consumer.IsolationLevel != ReadCommitted:
 		return ConfigurationError("Consumer.IsolationLevel must be ReadUncommitted or ReadCommitted")
+	}
+
+	if c.Consumer.Offsets.CommitInterval != 0 {
+		Logger.Println("Deprecation warning: Consumer.Offsets.CommitInterval exists for historical compatibility" +
+			" and should not be used. Please use Consumer.Offsets.AutoCommit, the current value will be ignored")
 	}
 
 	// validate IsolationLevel

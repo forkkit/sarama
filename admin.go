@@ -42,6 +42,14 @@ type ClusterAdmin interface {
 	// new partitions. This operation is supported by brokers with version 1.0.0 or higher.
 	CreatePartitions(topic string, count int32, assignment [][]int32, validateOnly bool) error
 
+	// Alter the replica assignment for partitions.
+	// This operation is supported by brokers with version 2.4.0.0 or higher.
+	AlterPartitionReassignments(topic string, assignment [][]int32) error
+
+	// Provides info on ongoing partitions replica reassignments.
+	// This operation is supported by brokers with version 2.4.0.0 or higher.
+	ListPartitionReassignments(topics string, partitions []int32) (topicStatus map[string]map[int32]*PartitionReplicaReassignmentsStatus, err error)
+
 	// Delete records whose offset is smaller than the given offset of the corresponding partition.
 	// This operation is supported by brokers with version 0.11.0.0 or higher.
 	DeleteRecords(topic string, partitionOffsets map[int32]int64) error
@@ -338,6 +346,15 @@ func (ca *clusterAdmin) ListTopics() (map[string]TopicDetail, error) {
 	describeConfigsReq := &DescribeConfigsRequest{
 		Resources: describeConfigsResources,
 	}
+
+	if ca.conf.Version.IsAtLeast(V1_1_0_0) {
+		describeConfigsReq.Version = 1
+	}
+
+	if ca.conf.Version.IsAtLeast(V2_0_0_0) {
+		describeConfigsReq.Version = 2
+	}
+
 	describeConfigsResp, err := b.DescribeConfigs(describeConfigsReq)
 	if err != nil {
 		return nil, err
@@ -443,8 +460,83 @@ func (ca *clusterAdmin) CreatePartitions(topic string, count int32, assignment [
 	})
 }
 
-func (ca *clusterAdmin) DeleteRecords(topic string, partitionOffsets map[int32]int64) error {
+func (ca *clusterAdmin) AlterPartitionReassignments(topic string, assignment [][]int32) error {
+	if topic == "" {
+		return ErrInvalidTopic
+	}
 
+	request := &AlterPartitionReassignmentsRequest{
+		TimeoutMs: int32(60000),
+		Version:   int16(0),
+	}
+
+	for i := 0; i < len(assignment); i++ {
+		request.AddBlock(topic, int32(i), assignment[i])
+	}
+
+	return ca.retryOnError(isErrNoController, func() error {
+		b, err := ca.Controller()
+		if err != nil {
+			return err
+		}
+
+		errs := make([]error, 0)
+
+		rsp, err := b.AlterPartitionReassignments(request)
+
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			if rsp.ErrorCode > 0 {
+				errs = append(errs, errors.New(rsp.ErrorCode.Error()))
+			}
+
+			for topic, topicErrors := range rsp.Errors {
+				for partition, partitionError := range topicErrors {
+					if partitionError.errorCode != ErrNoError {
+						errStr := fmt.Sprintf("[%s-%d]: %s", topic, partition, partitionError.errorCode.Error())
+						errs = append(errs, errors.New(errStr))
+					}
+				}
+			}
+		}
+
+		if len(errs) > 0 {
+			return ErrReassignPartitions{MultiError{&errs}}
+		}
+
+		return nil
+	})
+}
+
+func (ca *clusterAdmin) ListPartitionReassignments(topic string, partitions []int32) (topicStatus map[string]map[int32]*PartitionReplicaReassignmentsStatus, err error) {
+	if topic == "" {
+		return nil, ErrInvalidTopic
+	}
+
+	request := &ListPartitionReassignmentsRequest{
+		TimeoutMs: int32(60000),
+		Version:   int16(0),
+	}
+
+	request.AddBlock(topic, partitions)
+
+	b, err := ca.Controller()
+	if err != nil {
+		return nil, err
+	}
+	_ = b.Open(ca.client.Config())
+
+	rsp, err := b.ListPartitionReassignments(request)
+
+	if err == nil && rsp != nil {
+		return rsp.TopicStatus, nil
+	} else {
+		return nil, err
+	}
+}
+
+func (ca *clusterAdmin) DeleteRecords(topic string, partitionOffsets map[int32]int64) error {
 	if topic == "" {
 		return ErrInvalidTopic
 	}
@@ -557,7 +649,6 @@ func (ca *clusterAdmin) DescribeConfig(resource ConfigResource) ([]ConfigEntry, 
 }
 
 func (ca *clusterAdmin) AlterConfig(resourceType ConfigResourceType, name string, entries map[string]*string, validateOnly bool) error {
-
 	var resources []*AlterConfigsResource
 	resources = append(resources, &AlterConfigsResource{
 		Type:          resourceType,
@@ -621,7 +712,6 @@ func (ca *clusterAdmin) CreateACL(resource Resource, acl Acl) error {
 }
 
 func (ca *clusterAdmin) ListAcls(filter AclFilter) ([]ResourceAcls, error) {
-
 	request := &DescribeAclsRequest{AclFilter: filter}
 
 	if ca.conf.Version.IsAtLeast(V2_0_0_0) {
@@ -669,7 +759,6 @@ func (ca *clusterAdmin) DeleteACL(filter AclFilter, validateOnly bool) ([]Matchi
 		for _, mACL := range fr.MatchingAcls {
 			mAcls = append(mAcls, *mACL)
 		}
-
 	}
 	return mAcls, nil
 }
@@ -683,7 +772,6 @@ func (ca *clusterAdmin) DescribeConsumerGroups(groups []string) (result []*Group
 			return nil, err
 		}
 		groupsPerBroker[controller] = append(groupsPerBroker[controller], group)
-
 	}
 
 	for broker, brokerGroups := range groupsPerBroker {
@@ -726,7 +814,6 @@ func (ca *clusterAdmin) ListConsumerGroups() (allGroups map[string]string, err e
 			}
 
 			groupMaps <- groups
-
 		}(b, ca.conf)
 	}
 

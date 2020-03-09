@@ -173,7 +173,6 @@ func testProducingMessages(t *testing.T, config *Config) {
 				t.Fatalf("Unexpected message with index %d: %s", i, message.Value)
 			}
 		}
-
 	}
 	safeClose(t, consumer)
 	safeClose(t, client)
@@ -260,6 +259,9 @@ func validateMetrics(t *testing.T, client Client) {
 		metricValidators.registerForBroker(broker, minCountHistogramValidator("response-size", 2))
 		metricValidators.registerForBroker(broker, minValHistogramValidator("response-size", 1))
 	}
+
+	// There should be no requests in flight anymore
+	metricValidators.registerForAllBrokers(broker, counterValidator("requests-in-flight", 0))
 
 	// Run the validators
 	metricValidators.run(t, client.Config().MetricRegistry)

@@ -149,7 +149,7 @@ func TestClusterAdminListTopics(t *testing.T) {
 	})
 
 	config := NewConfig()
-	config.Version = V1_0_0_0
+	config.Version = V1_1_0_0
 	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +172,7 @@ func TestClusterAdminListTopics(t *testing.T) {
 	if found {
 		t.Fatal(errors.New("default topic config entry incorrectly found in response"))
 	}
-	value, _ := topic.ConfigEntries["retention.ms"]
+	value := topic.ConfigEntries["retention.ms"]
 	if value == nil || *value != "5000" {
 		t.Fatal(errors.New("non-default topic config entry not found in response"))
 	}
@@ -326,6 +326,167 @@ func TestClusterAdminCreatePartitionsWithoutAuthorization(t *testing.T) {
 	if !strings.HasSuffix(err.Error(), want) {
 		t.Fatal(err)
 	}
+	err = admin.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClusterAdminAlterPartitionReassignments(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	secondBroker := NewMockBroker(t, 2)
+	defer secondBroker.Close()
+
+	seedBroker.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetController(secondBroker.BrokerID()).
+			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()).
+			SetBroker(secondBroker.Addr(), secondBroker.BrokerID()),
+	})
+
+	secondBroker.SetHandlerByMap(map[string]MockResponse{
+		"AlterPartitionReassignmentsRequest": NewMockAlterPartitionReassignmentsResponse(t),
+	})
+
+	config := NewConfig()
+	config.Version = V2_4_0_0
+	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var topicAssignment = make([][]int32, 0, 3)
+
+	err = admin.AlterPartitionReassignments("my_topic", topicAssignment)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = admin.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClusterAdminAlterPartitionReassignmentsWithDiffVersion(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	secondBroker := NewMockBroker(t, 2)
+	defer secondBroker.Close()
+
+	seedBroker.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetController(secondBroker.BrokerID()).
+			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()).
+			SetBroker(secondBroker.Addr(), secondBroker.BrokerID()),
+	})
+
+	secondBroker.SetHandlerByMap(map[string]MockResponse{
+		"AlterPartitionReassignmentsRequest": NewMockAlterPartitionReassignmentsResponse(t),
+	})
+
+	config := NewConfig()
+	config.Version = V2_3_0_0
+	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var topicAssignment = make([][]int32, 0, 3)
+
+	err = admin.AlterPartitionReassignments("my_topic", topicAssignment)
+
+	if !strings.ContainsAny(err.Error(), ErrUnsupportedVersion.Error()) {
+		t.Fatal(err)
+	}
+
+	err = admin.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClusterAdminListPartitionReassignments(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	secondBroker := NewMockBroker(t, 2)
+	defer secondBroker.Close()
+
+	seedBroker.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetController(secondBroker.BrokerID()).
+			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()).
+			SetBroker(secondBroker.Addr(), secondBroker.BrokerID()),
+	})
+
+	secondBroker.SetHandlerByMap(map[string]MockResponse{
+		"ListPartitionReassignmentsRequest": NewMockListPartitionReassignmentsResponse(t),
+	})
+
+	config := NewConfig()
+	config.Version = V2_4_0_0
+	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := admin.ListPartitionReassignments("my_topic", []int32{0, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	partitionStatus, ok := response["my_topic"]
+	if !ok {
+		t.Fatalf("topic missing in response")
+	} else {
+		if len(partitionStatus) != 2 {
+			t.Fatalf("partition missing in response")
+		}
+	}
+
+	err = admin.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClusterAdminListPartitionReassignmentsWithDiffVersion(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	secondBroker := NewMockBroker(t, 2)
+	defer secondBroker.Close()
+
+	seedBroker.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetController(secondBroker.BrokerID()).
+			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()).
+			SetBroker(secondBroker.Addr(), secondBroker.BrokerID()),
+	})
+
+	secondBroker.SetHandlerByMap(map[string]MockResponse{
+		"ListPartitionReassignmentsRequest": NewMockListPartitionReassignmentsResponse(t),
+	})
+
+	config := NewConfig()
+	config.Version = V2_3_0_0
+	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var partitions = make([]int32, 0)
+
+	_, err = admin.ListPartitionReassignments("my_topic", partitions)
+
+	if !strings.ContainsAny(err.Error(), ErrUnsupportedVersion.Error()) {
+		t.Fatal(err)
+	}
+
 	err = admin.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -615,8 +776,8 @@ func TestClusterAdminAlterConfig(t *testing.T) {
 
 	var value string
 	entries := make(map[string]*string)
-	value = "3"
-	entries["ReplicationFactor"] = &value
+	value = "60000"
+	entries["retention.ms"] = &value
 	err = admin.AlterConfig(TopicResource, "my_topic", entries, false)
 	if err != nil {
 		t.Fatal(err)
@@ -959,7 +1120,6 @@ func TestListConsumerGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 }
 
 func TestListConsumerGroupsMultiBroker(t *testing.T) {
@@ -1024,7 +1184,6 @@ func TestListConsumerGroupsMultiBroker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 }
 
 func TestListConsumerGroupOffsets(t *testing.T) {
@@ -1053,7 +1212,7 @@ func TestListConsumerGroupOffsets(t *testing.T) {
 	}
 
 	response, err := admin.ListConsumerGroupOffsets(group, map[string][]int32{
-		topic: []int32{0},
+		topic: {0},
 	})
 	if err != nil {
 		t.Fatalf("ListConsumerGroupOffsets failed with error %v", err)
@@ -1072,7 +1231,6 @@ func TestListConsumerGroupOffsets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 }
 
 func TestDeleteConsumerGroup(t *testing.T) {
@@ -1102,7 +1260,6 @@ func TestDeleteConsumerGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteConsumerGroup failed with error %v", err)
 	}
-
 }
 
 // TestRefreshMetaDataWithDifferentController ensures that the cached
